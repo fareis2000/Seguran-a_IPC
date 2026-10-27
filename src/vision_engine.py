@@ -1,9 +1,12 @@
-"""Motor biométrico de detecção facial (YuNet), reconhecimento (SFace 128D)
-e prova de vida anti-fraude por piscada (InsightFace 2d106det EAR adaptativo)."""
+"""Motor biométrico de detecção facial (YuNet), reconhecimento rigoroso (SFace 128D
+por consenso de centroide + múltiplas amostras + janela temporal) e prova de vida
+anti-fraude por piscada (InsightFace 2d106det EAR adaptativo)."""
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
+import math
 import time
 from typing import Sequence
 
@@ -48,16 +51,18 @@ class FaceAnalysisResult:
 
 @dataclass
 class LivenessTrackerState:
-    """Rastreia continuidade espacial do rosto e transição real Aberto -> Fechado -> Aberto."""
+    """Rastreia continuidade espacial, histórico temporal de scores e piscada real."""
 
     last_center: tuple[float, float] | None = None
     last_size: float = 0.0
     missed_frames: int = 0
     matched_user_id: int | None = None
+    score_history: deque[float] = field(default_factory=lambda: deque(maxlen=6))
     open_ear_baseline: float = 0.0
     open_frames_count: int = 0
     blink_closed_frames: int = 0
     saw_blink_dip: bool = False
+    reopen_verified_frames: int = 0
     liveness_confirmed: bool = False
     track_started_at: float = field(default_factory=time.monotonic)
     unauthorized_since: float | None = None
@@ -67,17 +72,29 @@ class LivenessTrackerState:
         self.last_size = 0.0
         self.missed_frames = 0
         self.matched_user_id = None
+        self.score_history.clear()
         self.open_ear_baseline = 0.0
         self.open_frames_count = 0
         self.blink_closed_frames = 0
         self.saw_blink_dip = False
+        self.reopen_verified_frames = 0
         self.liveness_confirmed = False
         self.track_started_at = time.monotonic()
         self.unauthorized_since = None
 
+    def reset_identity(self) -> None:
+        self.matched_user_id = None
+        self.score_history.clear()
+        self.open_ear_baseline = 0.0
+        self.open_frames_count = 0
+        self.blink_closed_frames = 0
+        self.saw_blink_dip = False
+        self.reopen_verified_frames = 0
+        self.liveness_confirmed = False
+
 
 class BiometricVisionEngine:
-    """Executa detecção, extração de embeddings 128D e prova de vida 106-pontos em CPU."""
+    """Executa detecção, consenso biométrico 128D e prova de vida 106-pontos em CPU."""
 
     def __init__(self) -> None:
         if not YUNET_MODEL_PATH.exists():
@@ -98,7 +115,7 @@ class BiometricVisionEngine:
             det_buf,
             empty_cfg,
             (320, 320),
-            0.78,
+            0.82,
             0.3,
             5000,
         )
@@ -131,10 +148,36 @@ class BiometricVisionEngine:
         if scale != 1.0:
             faces[:, :14] /= scale
 
-        # Ordena do maior rosto (mais próximo da webcam) para o menor
         areas = faces[:, 2] * faces[:, 3]
         order = np.argsort(-areas)
         return faces[order]
+
+    @staticmethod
+    def _is_frontal_pose(raw_face: np.ndarray) -> tuple[bool, str]:
+        """Rejeita perfis laterais extremos ou cabeças muito inclinadas que distorcem o alinhamento."""
+        bw = float(raw_face[2])
+        if bw < 1.0:
+            return False, "Aproxime-se da câmera"
+
+        r_eye = raw_face[4:6].astype(np.float64)
+        l_eye = raw_face[6:8].astype(np.float64)
+        nose = raw_face[8:10].astype(np.float64)
+
+        eye_vec = l_eye - r_eye
+        eye_dist = float(np.hypot(eye_vec[0], eye_vec[1]))
+        if eye_dist < bw * 0.21:
+            return False, "Olhe de frente para a câmera"
+
+        roll_deg = abs(math.degrees(math.atan2(eye_vec[1], eye_vec[0])))
+        if roll_deg > 26.0:
+            return False, "Mantenha a cabeça alinhada de frente para a câmera"
+
+        # Projeção horizontal do nariz entre o olho direito (0.0) e esquerdo (1.0)
+        nose_rel = float(np.dot(nose - r_eye, eye_vec) / (eye_dist * eye_dist + 1e-6))
+        if nose_rel < 0.18 or nose_rel > 0.82:
+            return False, "Vire o rosto de frente para a câmera"
+
+        return True, ""
 
     def extract_embedding(self, frame_bgr: np.ndarray, raw_face: np.ndarray) -> np.ndarray:
         """Alinha o recorte facial pelos 5 pontos do YuNet e extrai vetor SFace 128-D."""
@@ -165,16 +208,13 @@ class BiometricVisionEngine:
         pts_crop = (pred + 1.0) * 96.0
         pts_img = (pts_crop - m_mat[:, 2]) / scale
 
-        right_eye = pts_img[33:43]  # 10 pontos olho direito
-        left_eye = pts_img[87:97]   # 10 pontos olho esquerdo
+        right_eye = pts_img[33:43]
+        left_eye = pts_img[87:97]
 
         ear_r = self._single_eye_ear_106(right_eye)
         ear_l = self._single_eye_ear_106(left_eye)
         ear = float((ear_r + ear_l) * 0.5)
 
-        # Polígono ordenado das pálpebras para renderização visual no HUD:
-        # canto esq (2) -> sup-esq (8) -> sup-centro (7) -> sup-dir (9) -> canto dir (6)
-        # -> inf-dir (4) -> inf-centro (0) -> inf-esq (3)
         poly_idx = [2, 8, 7, 9, 6, 4, 0, 3]
         r_poly = right_eye[poly_idx].astype(np.int32)
         l_poly = left_eye[poly_idx].astype(np.int32)
@@ -182,7 +222,6 @@ class BiometricVisionEngine:
 
     @staticmethod
     def _single_eye_ear_106(eye_pts: np.ndarray) -> float:
-        """Calcula EAR usando os 3 pares verticais de pálpebra e os 2 cantos horizontais do 2d106det."""
         horiz = float(np.linalg.norm(eye_pts[6] - eye_pts[2]))
         if horiz < 1e-4:
             return 0.0
@@ -191,36 +230,76 @@ class BiometricVisionEngine:
         v3 = float(np.linalg.norm(eye_pts[9] - eye_pts[4]))
         return (v1 + v2 + v3) / (3.0 * horiz)
 
+    @staticmethod
+    def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+        flat = np.asarray(vec, dtype=np.float32).ravel()
+        norm = float(np.linalg.norm(flat))
+        if norm < 1e-8:
+            return flat
+        return flat / norm
+
     def match_user(
         self,
         embedding: np.ndarray,
         users: Sequence[EnrolledUser],
         threshold: float,
     ) -> tuple[EnrolledUser | None, float]:
-        best_score = -1.0
+        """Compara o vetor contra os usuários ativos exigindo consenso entre:
+        1) Similaridade com o centroide médio L2 do usuário;
+        2) Média das Top-3 amostras cadastradas (impede picos isolados em 1 amostra);
+        3) Quantidade mínima de amostras concordantes quando o cadastro tem >= 3 amostras.
+        """
+        cand = self._l2_normalize(embedding)
+        best_consensus = -1.0
         best_user: EnrolledUser | None = None
+        best_passed_all = False
 
         for user in users:
-            if not user.active:
+            if not user.active or not user.embeddings:
                 continue
-            for ref_emb in user.embeddings:
-                score = float(
-                    self._recognizer.match(
-                        embedding, ref_emb, cv2.FaceRecognizerSF_FR_COSINE
-                    )
-                )
-                if score > best_score:
-                    best_score = score
-                    best_user = user
 
-        if best_user is not None and best_score >= threshold:
-            return best_user, max(0.0, best_score)
-        return None, max(0.0, best_score)
+            ref_norms = [self._l2_normalize(e) for e in user.embeddings]
+            indiv_scores = sorted(
+                (float(np.dot(cand, r)) for r in ref_norms), reverse=True
+            )
+
+            centroid = np.mean(ref_norms, axis=0)
+            c_norm = float(np.linalg.norm(centroid))
+            if c_norm > 1e-8:
+                centroid = centroid / c_norm
+            centroid_score = float(np.dot(cand, centroid))
+
+            k_top = min(3, len(indiv_scores))
+            top_k_mean = float(sum(indiv_scores[:k_top]) / k_top)
+            consensus = 0.50 * centroid_score + 0.50 * top_k_mean
+
+            # Exige que múltiplas amostras concordem (evita falso-positivo por 1 amostra ruidosa)
+            min_sample_floor = threshold - 0.05
+            if len(indiv_scores) >= 3:
+                samples_ok = sum(1 for s in indiv_scores if s >= min_sample_floor) >= 3
+            else:
+                samples_ok = indiv_scores[-1] >= min_sample_floor
+
+            user_passed = (
+                consensus >= threshold
+                and centroid_score >= (threshold - 0.03)
+                and samples_ok
+            )
+
+            if consensus > best_consensus:
+                best_consensus = consensus
+                best_user = user
+                best_passed_all = user_passed
+
+        clamped_score = max(0.0, best_consensus)
+        if best_user is not None and best_passed_all:
+            return best_user, clamped_score
+        return None, clamped_score
 
     def evaluate_enrollment_sample(
         self, frame_bgr: np.ndarray
     ) -> tuple[bool, str, np.ndarray | None, tuple[int, int, int, int] | None]:
-        """Valida qualidade da captura para cadastro (rosto único, tamanho bom, centralizado e iluminado)."""
+        """Valida qualidade rigorosa da amostra para cadastro (frontal, iluminada e olhos abertos)."""
         faces = self.detect_faces(frame_bgr)
         if faces is None or len(faces) == 0:
             return False, "Nenhum rosto detectado. Olhe para a câmera.", None, None
@@ -236,11 +315,19 @@ class BiometricVisionEngine:
         if x < 15 or y < 15 or (x + bw) > (fw - 15) or (y + bh) > (fh - 15):
             return False, "Centralize o rosto no quadro da câmera.", None, (x, y, bw, bh)
 
+        pose_ok, pose_msg = self._is_frontal_pose(raw)
+        if not pose_ok:
+            return False, pose_msg, None, (x, y, bw, bh)
+
         face_roi = frame_bgr[max(0, y) : min(fh, y + bh), max(0, x) : min(fw, x + bw)]
         if face_roi.size > 0:
             gray_mean = float(cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY).mean())
-            if gray_mean < 40.0:
-                return False, "Ambiente muito escuro. Melhore a iluminação.", None, (x, y, bw, bh)
+            if gray_mean < 42.0:
+                return False, "Ambiente escuro. Melhore a iluminação frontal.", None, (x, y, bw, bh)
+
+        ear, _, _ = self.compute_ear_and_contours(frame_bgr, (x, y, bw, bh))
+        if ear < 0.20:
+            return False, "Mantenha os olhos abertos durante a captura.", None, (x, y, bw, bh)
 
         emb = self.extract_embedding(frame_bgr, raw)
         return True, "Amostra facial válida!", emb, (x, y, bw, bh)
@@ -249,16 +336,16 @@ class BiometricVisionEngine:
         self,
         frame_bgr: np.ndarray,
         enrolled_users: Sequence[EnrolledUser],
-        threshold: float = 0.38,
+        threshold: float = 0.58,
         require_liveness: bool = True,
     ) -> FaceAnalysisResult:
-        """Executa pipeline completo de autenticação facial + prova de vida contínua."""
+        """Executa pipeline completo de autenticação facial + consenso temporal + prova de vida."""
         res = FaceAnalysisResult()
         faces = self.detect_faces(frame_bgr)
 
         if faces is None or len(faces) == 0:
             self.tracker.missed_frames += 1
-            if self.tracker.missed_frames > 3:
+            if self.tracker.missed_frames > 2:
                 self.tracker.reset()
             res.status_message = "Posicione o rosto em frente à câmera"
             return res
@@ -272,14 +359,12 @@ class BiometricVisionEngine:
         res.bbox = (x, y, bw, bh)
         res.raw_face = raw
 
-        if bw < 75 or bh < 75:
+        if bw < 85 or bh < 85:
             self.tracker.reset()
             res.status_message = "Aproxime-se da câmera para autenticar"
             return res
 
-        res.quality_ok = True
-
-        # Verifica continuidade espacial do rosto (evita troca rápida por foto/celular)
+        # Verifica continuidade espacial estrita do rosto (impede troca de pessoa ou celular)
         cx, cy = x + bw * 0.5, y + bh * 0.5
         size = float(max(bw, bh))
         if self.tracker.last_center is not None:
@@ -287,70 +372,97 @@ class BiometricVisionEngine:
                 np.hypot(cx - self.tracker.last_center[0], cy - self.tracker.last_center[1])
             )
             size_ratio = abs(size - self.tracker.last_size) / max(self.tracker.last_size, 1.0)
-            if dist > size * 0.35 or size_ratio > 0.35:
+            if dist > size * 0.28 or size_ratio > 0.28:
                 self.tracker.reset()
 
         self.tracker.last_center = (cx, cy)
         self.tracker.last_size = size
 
-        # Extração e comparação biométrica 128D
-        emb = self.extract_embedding(frame_bgr, raw)
-        res.embedding = emb
-        matched_user, best_score = self.match_user(emb, enrolled_users, threshold)
-
-        # Permite leve tolerância (-0.03) APENAS nos frames exatos em que o olho está fechado piscando
         ear, r_poly, l_poly = self.compute_ear_and_contours(frame_bgr, res.bbox)
         res.ear = ear
         res.right_eye_contour = r_poly
         res.left_eye_contour = l_poly
 
-        if (
-            matched_user is None
+        pose_ok, pose_msg = self._is_frontal_pose(raw)
+        if not pose_ok:
+            self.tracker.reset_identity()
+            res.status_message = pose_msg
+            return res
+
+        res.quality_ok = True
+
+        # Extração e consenso biométrico 128D
+        emb = self.extract_embedding(frame_bgr, raw)
+        res.embedding = emb
+        matched_user, consensus_score = self.match_user(emb, enrolled_users, threshold)
+        res.best_score = consensus_score
+
+        # Durante os poucos frames de olhos efetivamente fechados (piscada em curso),
+        # só mantém o estado se o dono JÁ tiver sido validado em >= 4 frames consecutivos antes!
+        close_thresh_est = (
+            max(0.145, self.tracker.open_ear_baseline * 0.74)
+            if self.tracker.open_ear_baseline > 0.0
+            else 0.18
+        )
+        in_valid_blink_closure = (
+            require_liveness
             and self.tracker.matched_user_id is not None
-            and self.tracker.open_frames_count >= 3
-            and ear < 0.22
-        ):
-            matched_user, best_score = self.match_user(
-                emb, enrolled_users, max(0.30, threshold - 0.04)
-            )
+            and self.tracker.open_frames_count >= 4
+            and ear < close_thresh_est
+            and consensus_score >= (threshold - 0.06)
+        )
 
-        res.matched_user = matched_user
-        res.best_score = best_score
-
-        if matched_user is None:
-            # Rosto NÃO autorizado!
-            self.tracker.matched_user_id = None
-            self.tracker.open_frames_count = 0
-            self.tracker.blink_closed_frames = 0
-            self.tracker.saw_blink_dip = False
-            self.tracker.liveness_confirmed = False
+        if matched_user is None and not in_valid_blink_closure:
+            # Rosto NÃO autorizado — zera imediatamente qualquer progresso anterior!
+            self.tracker.reset_identity()
             if self.tracker.unauthorized_since is None:
                 self.tracker.unauthorized_since = time.monotonic()
             res.liveness_stage = "NAO_AUTORIZADO"
             res.status_message = "Acesso negado: rosto não autorizado neste computador"
             return res
 
-        # Rosto pertence a um usuário autorizado
+        if matched_user is None and in_valid_blink_closure:
+            # Mantém referência ao dono já confirmado apenas enquanto a pálpebra está fechada
+            matched_user = next(
+                (u for u in enrolled_users if u.id == self.tracker.matched_user_id), None
+            )
+            if matched_user is None:
+                self.tracker.reset_identity()
+                return res
+
+        assert matched_user is not None
+        res.matched_user = matched_user
         self.tracker.unauthorized_since = None
+
         if self.tracker.matched_user_id != matched_user.id:
+            self.tracker.reset_identity()
             self.tracker.matched_user_id = matched_user.id
-            self.tracker.open_ear_baseline = 0.0
-            self.tracker.open_frames_count = 0
-            self.tracker.blink_closed_frames = 0
-            self.tracker.saw_blink_dip = False
-            self.tracker.liveness_confirmed = False
             self.tracker.track_started_at = time.monotonic()
 
+        if ear >= close_thresh_est:
+            self.tracker.score_history.append(consensus_score)
+
+        rolling_mean = (
+            float(sum(self.tracker.score_history) / len(self.tracker.score_history))
+            if self.tracker.score_history
+            else consensus_score
+        )
+
+        # Modo sem piscada: ainda assim exige >= 4 frames consecutivos acima do limiar!
         if not require_liveness:
-            res.liveness_passed = True
-            res.liveness_stage = "CONFIRMADO"
-            res.authenticated = True
-            res.status_message = f"Bem-vindo(a), {matched_user.name}!"
+            if len(self.tracker.score_history) >= 4 and rolling_mean >= threshold:
+                res.liveness_passed = True
+                res.liveness_stage = "CONFIRMADO"
+                res.authenticated = True
+                res.status_message = f"Bem-vindo(a), {matched_user.name}!"
+            else:
+                res.liveness_stage = "CONFIRMANDO_IDENTIDADE"
+                res.status_message = f"Confirmando identidade de {matched_user.name}..."
             return res
 
-        # Máquina de estados de Prova de Vida (Piscada com linha de base adaptativa)
-        if self.tracker.open_frames_count < 3:
-            if ear >= 0.21:
+        # Etapa 1: exige >= 4 frames consecutivos de olhos abertos com identidade estrita aprovada
+        if self.tracker.open_frames_count < 4:
+            if ear >= 0.21 and consensus_score >= threshold:
                 if self.tracker.open_ear_baseline == 0.0:
                     self.tracker.open_ear_baseline = float(np.clip(ear, 0.22, 0.42))
                 else:
@@ -359,21 +471,21 @@ class BiometricVisionEngine:
                     )
                 self.tracker.open_frames_count += 1
             res.liveness_stage = "CALIBRANDO_OLHOS"
-            res.status_message = f"Olá, {matched_user.name}! Mantenha os olhos abertos..."
+            res.status_message = f"Identificando {matched_user.name}... mantenha os olhos abertos"
             return res
 
         close_thresh = max(0.145, self.tracker.open_ear_baseline * 0.74)
         reopen_thresh = max(0.195, self.tracker.open_ear_baseline * 0.85)
 
+        # Etapa 2: aguarda o fechamento rápido das pálpebras (piscada)
         if not self.tracker.saw_blink_dip:
             if ear < close_thresh:
                 self.tracker.blink_closed_frames += 1
-                if self.tracker.blink_closed_frames >= 1:
-                    self.tracker.saw_blink_dip = True
+                self.tracker.saw_blink_dip = True
+                self.tracker.reopen_verified_frames = 0
                 res.liveness_stage = "PISCANDO"
                 res.status_message = f"Detectando piscada de {matched_user.name}..."
             else:
-                # Atualiza suavemente a linha de base de olhos abertos
                 if ear > self.tracker.open_ear_baseline * 0.90:
                     self.tracker.open_ear_baseline = float(
                         np.clip(0.9 * self.tracker.open_ear_baseline + 0.1 * ear, 0.22, 0.42)
@@ -382,30 +494,43 @@ class BiometricVisionEngine:
                 res.status_message = f"Olá, {matched_user.name}! Pisque os olhos para liberar"
             return res
 
-        # Já detectou fechamento da pálpebra -> aguarda reabertura natural
+        # Etapa 3: pálpebras fechadas -> aguarda reabertura natural
         if ear < close_thresh:
             self.tracker.blink_closed_frames += 1
-            if self.tracker.blink_closed_frames > 18:
-                # Olhos fechados por tempo excessivo -> reinicia ciclo da piscada
+            if self.tracker.blink_closed_frames > 16:
                 self.tracker.blink_closed_frames = 0
                 self.tracker.saw_blink_dip = False
+                self.tracker.reopen_verified_frames = 0
             res.liveness_stage = "PISCANDO"
-            res.status_message = "Agora abra os olhos para concluir..."
+            res.status_message = "Abra os olhos normalmente para concluir..."
             return res
 
+        # Etapa 4: revalidação estrita em múltiplos frames com olhos reabertos no mesmo rosto!
         if ear >= reopen_thresh:
-            # Revalidação estrita de identidade com olhos reabertos no mesmo rosto contínuo!
-            strict_user, _ = self.match_user(emb, enrolled_users, threshold)
-            if strict_user is not None and strict_user.id == matched_user.id:
-                self.tracker.liveness_confirmed = True
-                res.liveness_passed = True
-                res.liveness_stage = "CONFIRMADO"
-                res.authenticated = True
-                res.status_message = f"Acesso liberado! Bem-vindo(a), {matched_user.name}."
+            strict_user, strict_score = self.match_user(emb, enrolled_users, threshold)
+            if (
+                strict_user is not None
+                and strict_user.id == matched_user.id
+                and strict_score >= threshold
+                and rolling_mean >= threshold
+            ):
+                self.tracker.reopen_verified_frames += 1
+                if self.tracker.reopen_verified_frames >= 2:
+                    self.tracker.liveness_confirmed = True
+                    res.liveness_passed = True
+                    res.liveness_stage = "CONFIRMADO"
+                    res.authenticated = True
+                    res.best_score = rolling_mean
+                    res.status_message = f"Acesso liberado! Bem-vindo(a), {matched_user.name}."
+                    return res
+            else:
+                self.tracker.reset_identity()
+                res.liveness_stage = "NAO_AUTORIZADO"
+                res.status_message = "Falha na confirmação pós-piscada. Tente novamente."
                 return res
 
         res.liveness_stage = "REABRINDO_OLHOS"
-        res.status_message = f"Quase lá, {matched_user.name}! Abra os olhos normalmente..."
+        res.status_message = f"Confirmando {matched_user.name}..."
         return res
 
 
@@ -419,7 +544,6 @@ def draw_hud_overlay(
     h, w = vis.shape[:2]
 
     if not analysis.face_found or analysis.bbox is None:
-        # Guia oval central sutil quando nenhum rosto está enquadrado
         cv2.ellipse(
             vis,
             (w // 2, h // 2),
@@ -438,44 +562,43 @@ def draw_hud_overlay(
         bx = w - bx - bw
 
     if analysis.authenticated:
-        color = (80, 220, 100)       # Verde sucesso
+        color = (80, 220, 100)
     elif analysis.matched_user is not None:
-        color = (255, 195, 40)       # Ciano/Âmbar aguardando piscada
+        color = (255, 195, 40)
+    elif not analysis.quality_ok:
+        color = (180, 180, 195)
     else:
-        color = (65, 70, 235)        # Vermelho alerta intruso
+        color = (65, 70, 235)
 
-    # Cantos estilo scanner biométrico
     corner = max(16, min(bw, bh) // 5)
     thickness = 2
     x2, y2 = bx + bw, by + bh
-    # Superior esquerdo
     cv2.line(vis, (bx, by), (bx + corner, by), color, thickness, cv2.LINE_AA)
     cv2.line(vis, (bx, by), (bx, by + corner), color, thickness, cv2.LINE_AA)
-    # Superior direito
     cv2.line(vis, (x2, by), (x2 - corner, by), color, thickness, cv2.LINE_AA)
     cv2.line(vis, (x2, by), (x2, by + corner), color, thickness, cv2.LINE_AA)
-    # Inferior esquerdo
     cv2.line(vis, (bx, y2), (bx + corner, y2), color, thickness, cv2.LINE_AA)
     cv2.line(vis, (bx, y2), (bx, y2 - corner), color, thickness, cv2.LINE_AA)
-    # Inferior direito
     cv2.line(vis, (x2, y2), (x2 - corner, y2), color, thickness, cv2.LINE_AA)
     cv2.line(vis, (x2, y2), (x2, y2 - corner), color, thickness, cv2.LINE_AA)
 
-    # Desenha contorno vivo das pálpebras (feedback imediato da prova de vida)
     for eye_poly in (analysis.right_eye_contour, analysis.left_eye_contour):
         if eye_poly is not None:
             pts = eye_poly.copy()
             if mirror:
                 pts[:, 0] = w - pts[:, 0]
-            cv2.polylines(vis, [pts], isClosed=True, color=(235, 225, 60), thickness=1, lineType=cv2.LINE_AA)
+            cv2.polylines(
+                vis, [pts], isClosed=True, color=(235, 225, 60), thickness=1, lineType=cv2.LINE_AA
+            )
 
-    # Etiqueta com nome / score
     if analysis.matched_user is not None:
         tag = f"{analysis.matched_user.name} ({int(min(99, analysis.best_score * 100))}%)"
+    elif not analysis.quality_ok:
+        tag = "AJUSTE A POSICAO"
     else:
-        tag = "NAO AUTORIZADO"
+        tag = f"NAO AUTORIZADO ({int(min(99, analysis.best_score * 100))}%)"
 
-    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.54, 1)
+    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
     ty = max(th + 10, by - 8)
     cv2.rectangle(vis, (bx, ty - th - 8), (bx + tw + 14, ty + 4), color, -1)
     cv2.putText(
@@ -483,7 +606,7 @@ def draw_hud_overlay(
         tag,
         (bx + 7, ty - 2),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.54,
+        0.52,
         (15, 15, 20),
         1,
         cv2.LINE_AA,

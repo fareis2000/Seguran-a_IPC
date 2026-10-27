@@ -51,7 +51,7 @@ class LockScreenOverlay:
         self._alert_text: str = ""
 
         self._enrolled_users: list[EnrolledUser] = self.storage.list_users(only_active=True)
-        self._threshold: float = self.storage.get_float_setting("similarity_threshold", 0.38)
+        self._threshold: float = self.storage.get_float_setting("similarity_threshold", 0.58)
         self._require_liveness: bool = self.storage.get_bool_setting("require_liveness", True)
         self._camera_index: int = self.storage.get_int_setting("camera_index", 0)
         self._cooldown_sec: float = float(

@@ -27,7 +27,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "lock_on_startup": "1",
     "lock_on_unlock": "1",
     "require_liveness": "1",
-    "similarity_threshold": "0.38",
+    "similarity_threshold": "0.58",
     "camera_index": "0",
     "intruder_cooldown_sec": "8",
 }
@@ -126,6 +126,25 @@ class StorageManager:
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                     (key, default_val),
                 )
+            # Migração automática de segurança v2: eleva limiares antigos (< 0.50, ex: 0.38) para 0.58
+            mig = conn.execute(
+                "SELECT value FROM settings WHERE key = 'security_threshold_v2_migrated'"
+            ).fetchone()
+            if mig is None:
+                row_thr = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'similarity_threshold'"
+                ).fetchone()
+                try:
+                    curr_thr = float(row_thr["value"]) if row_thr else 0.38
+                except ValueError:
+                    curr_thr = 0.38
+                if curr_thr < 0.50:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES ('similarity_threshold', '0.58')"
+                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('security_threshold_v2_migrated', '1')"
+                )
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -190,7 +209,7 @@ class StorageManager:
         val = self.get_setting(key, "1" if default else "0")
         return val in ("1", "true", "True", "yes")
 
-    def get_float_setting(self, key: str, default: float = 0.38) -> float:
+    def get_float_setting(self, key: str, default: float = 0.58) -> float:
         try:
             return float(self.get_setting(key, str(default)))
         except ValueError:

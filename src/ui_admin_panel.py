@@ -643,10 +643,10 @@ class AdminPanelWindow:
         sep1 = ctk.CTkFrame(scroll, fg_color="#0F172A", corner_radius=10)
         sep1.pack(fill="x", padx=18, pady=12)
 
-        curr_thresh = self.storage.get_float_setting("similarity_threshold", 0.38)
+        curr_thresh = self.storage.get_float_setting("similarity_threshold", 0.58)
         self._thresh_lbl = ctk.CTkLabel(
             sep1,
-            text=f"Rigor da Comparação Facial: {curr_thresh:.2f} (Recomendado: 0.38)",
+            text=f"Rigor da Comparação Facial: {curr_thresh:.2f} (Recomendado: 0.58)",
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             text_color="#E2E8F0",
         )
@@ -654,9 +654,9 @@ class AdminPanelWindow:
 
         self._thresh_slider = ctk.CTkSlider(
             sep1,
-            from_=0.32,
-            to=0.52,
-            number_of_steps=20,
+            from_=0.50,
+            to=0.74,
+            number_of_steps=24,
             width=360,
             command=self._on_threshold_slide,
         )
@@ -868,7 +868,7 @@ class AdminPanelWindow:
 
         elif self._test_mode:
             users = self.storage.list_users(only_active=True)
-            thresh = self.storage.get_float_setting("similarity_threshold", 0.38)
+            thresh = self.storage.get_float_setting("similarity_threshold", 0.58)
             req_live = self.storage.get_bool_setting("require_liveness", True)
             res = self.vision.analyze_frame(frame, users, thresh, req_live)
             vis_bgr = draw_hud_overlay(frame, res, mirror=True)
@@ -1124,7 +1124,7 @@ class AdminPanelWindow:
     def _on_threshold_slide(self, value: float) -> None:
         rounded = round(float(value), 2)
         self._thresh_lbl.configure(
-            text=f"Rigor da Comparação Facial: {rounded:.2f} (Recomendado: 0.38)"
+            text=f"Rigor da Comparação Facial: {rounded:.2f} (Recomendado: 0.58)"
         )
         self.storage.set_setting("similarity_threshold", f"{rounded:.2f}")
 
