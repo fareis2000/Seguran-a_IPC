@@ -23,8 +23,10 @@ flowchart TD
     G -- "Sim (Mesmo Rosto Contínuo)" --> I["✅ Acesso Liberado + Webcam Desligada (0% CPU em Bandeja)"]
 ```
 
-### 1. Gatilhos Nativos do Windows (`Win32 API`)
-- **Inicialização Automática**: registra-se em `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` para bloquear o computador assim que a sessão do Windows inicia.
+### 1. Gatilhos Nativos de Boot Instantâneo (`Win32 API` + `Task Scheduler ONLOGON`)
+- **Disparo Antes do Windows Explorer (`SentinelPC_LogonGuard`)**: registra automaticamente uma Tarefa Agendada `ONLOGON` com **atraso zero (`Delay = PT0S`) e prioridade elevada (`Priority = 4`)**, além de zerar o `StartupDelayInMSec` do Explorer e manter chave `Run` de redundância.
+- **Motor Pré-Extraído Auto-Instalável (`--onedir` dentro de arquivo único)**: o `dist\SentinelPC.exe` distribui tudo em **1 único arquivo**, mas na primeira abertura instala o motor nativo descompactado em `%LOCALAPPDATA%\SentinelPC\runtime\SentinelPC_Core.exe`, eliminando 100% do atraso de extração no boot.
+- **Instant-Lock Assíncrono**: oculta a barra de tarefas e bloqueia todos os monitores/teclado imediatamente no logon, carregando o OpenCV e os modelos ONNX em segundo plano por trás da tela já bloqueada.
 - **Monitoramento de Sessão e Energia**: uma thread nativa Win32 (`WTSRegisterSessionNotification` + `WM_POWERBROADCAST`) detecta instantaneamente quando alguém desbloqueia a tela (`WTS_SESSION_UNLOCK`) ou acorda o PC de suspensão/hibernação, exigindo nova validação facial.
 - **Execução Leve em Segundo Plano**: após autenticar o dono do PC, a webcam é totalmente liberada (ficando disponível para reuniões no Teams, Meet ou Zoom) e o aplicativo permanece na **Bandeja do Sistema** consumindo ~0% de CPU até o próximo bloqueio.
 

@@ -9,7 +9,7 @@ import sys
 import traceback
 
 from src.paths import get_logs_dir
-from src.win_security import set_taskbar_visible
+from src.win_security import boost_process_priority, set_taskbar_visible
 
 
 def configure_logging() -> None:
@@ -22,6 +22,8 @@ def configure_logging() -> None:
 
 
 def main() -> int:
+    boost_process_priority()
+
     parser = argparse.ArgumentParser(description="SentinelPC — Autenticação Facial Corporativa")
     parser.add_argument(
         "--startup",
@@ -34,6 +36,21 @@ def main() -> int:
         help="Solicita abertura direta do Painel Administrativo da TI.",
     )
     args = parser.parse_args()
+
+    # Pré-bloqueio instantâneo da barra de tarefas em ~80ms no boot quando já configurado
+    if not args.admin:
+        try:
+            from src.storage import StorageManager
+
+            st = StorageManager()
+            if (
+                st.is_admin_configured()
+                and st.has_enrolled_users()
+                and st.get_bool_setting("lock_on_startup", True)
+            ):
+                set_taskbar_visible(False)
+        except Exception:
+            pass
 
     configure_logging()
     logging.info("Iniciando SentinelPC (startup=%s, admin=%s)", args.startup, args.admin)

@@ -1,34 +1,37 @@
-"""Tela de Bloqueio Kiosk Fullscreen (Multi-Monitor) com Reconhecimento Facial,
-Prova de Vida por Piscada, Registro Fotográfico de Intrusos e Contingência da TI."""
+"""Tela de Bloqueio Kiosk Fullscreen (Multi-Monitor) com Instant-Lock (< 0.8s):
+bloqueia todos os monitores imediatamente antes mesmo de carregar o OpenCV/ONNX
+em thread paralela, com Reconhecimento Facial, Prova de Vida e Contingência TI."""
 
 from __future__ import annotations
 
 from datetime import datetime
 import socket
+import threading
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import customtkinter as ctk
-import cv2
-import numpy as np
 from PIL import Image
 
 from src.storage import EnrolledUser, StorageManager
-from src.vision_engine import BiometricVisionEngine, draw_hud_overlay, open_fast_camera
 from src.win_security import WinSecurityController, get_all_monitors
+
+if TYPE_CHECKING:
+    from src.vision_engine import BiometricVisionEngine
 
 
 class LockScreenOverlay:
-    """Gerencia o bloqueio em tela cheia no monitor principal e blackout nos secundários."""
+    """Gerencia o bloqueio imediato em tela cheia no monitor principal e blackout nos secundários."""
 
     def __init__(
         self,
         master: ctk.CTk,
         storage: StorageManager,
-        vision: BiometricVisionEngine,
+        vision: BiometricVisionEngine | None,
         win_security: WinSecurityController,
         on_unlocked: Callable[[str], None] | None = None,
         on_open_admin: Callable[[], None] | None = None,
+        on_vision_ready: Callable[[Any], None] | None = None,
         reason: str = "Autenticação obrigatória",
     ) -> None:
         self.master = master
@@ -37,20 +40,22 @@ class LockScreenOverlay:
         self.win_security = win_security
         self.on_unlocked = on_unlocked
         self.on_open_admin = on_open_admin
+        self.on_vision_ready = on_vision_ready
         self.reason = reason
 
         self.is_active = True
         self._unlocking = False
+        self._engine_loading = vision is None
         self._secondary_windows: list[ctk.CTkToplevel] = []
-        self._cap: cv2.VideoCapture | None = None
-        self._last_raw_frame: np.ndarray | None = None
+        self._cap: Any = None
+        self._last_raw_frame: Any = None
         self._last_cam_retry: float = 0.0
         self._last_intruder_shot: float = 0.0
         self._last_spoof_shot: float = 0.0
         self._alert_until: float = 0.0
         self._alert_text: str = ""
 
-        self._enrolled_users: list[EnrolledUser] = self.storage.list_users(only_active=True)
+        self._enrolled_users: list[EnrolledUser] = []
         self._threshold: float = self.storage.get_float_setting("similarity_threshold", 0.58)
         self._require_liveness: bool = self.storage.get_bool_setting("require_liveness", True)
         self._camera_index: int = self.storage.get_int_setting("camera_index", 0)
@@ -58,14 +63,13 @@ class LockScreenOverlay:
             self.storage.get_int_setting("intruder_cooldown_sec", 8)
         )
 
-        self.vision.reset_tracker()
+        # Ativa bloqueio de teclado + ocultação da barra de tarefas imediatamente
         self.win_security.set_kiosk_lock(True)
 
         monitors = get_all_monitors()
         primary = monitors[0]
         secondaries = monitors[1:]
 
-        # Define dimensões do vídeo adaptadas à altura do monitor (ex: 768p vs 1080p)
         if primary.height <= 820:
             self._cam_w, self._cam_h = 460, 345
         else:
@@ -104,19 +108,63 @@ class LockScreenOverlay:
             self._secondary_windows.append(sec)
 
         self._build_ui(primary.width, primary.height)
-        self._open_camera_if_needed()
 
         self.win.lift()
         self.win.focus_force()
+        # Força pintura imediata na tela antes de carregar bibliotecas pesadas de IA/câmera!
+        try:
+            for sec in self._secondary_windows:
+                sec.update()
+            self.win.update()
+        except Exception:
+            pass
+
+        if self.vision is not None:
+            self.vision.reset_tracker()
+            self._enrolled_users = self.storage.list_users(only_active=True)
+
+        # Inicia carregamento paralelo do motor biométrico + câmera sem travar a tela bloqueada
+        threading.Thread(
+            target=self._bg_prepare_vision_and_camera,
+            name="SentinelFastCamLoader",
+            daemon=True,
+        ).start()
 
         self._tick_clock()
         self._tick_watchdog()
         self._tick_camera()
 
+    def _bg_prepare_vision_and_camera(self) -> None:
+        """Carrega OpenCV, modelos ONNX e abre a webcam em background enquanto a tela já está bloqueada."""
+        try:
+            from src.vision_engine import BiometricVisionEngine, open_fast_camera
+
+            if not self._enrolled_users:
+                self._enrolled_users = self.storage.list_users(only_active=True)
+
+            if self.vision is None:
+                eng = BiometricVisionEngine()
+                if not self.is_active:
+                    return
+                self.vision = eng
+                if self.on_vision_ready is not None:
+                    self.on_vision_ready(eng)
+
+            if self.is_active and self._cap is None:
+                cap = open_fast_camera(self._camera_index, 640, 480)
+                if self.is_active:
+                    self._cap = cap
+                else:
+                    cap.release()
+        except Exception:
+            pass
+        finally:
+            self._engine_loading = False
+            self._last_cam_retry = time.monotonic()
+
     def _build_ui(self, screen_w: int, screen_h: int) -> None:
         compact = screen_h <= 820
 
-        # Barra Superior
         header = ctk.CTkFrame(self.win, fg_color="#0F172A", corner_radius=0, height=58)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
@@ -131,7 +179,7 @@ class LockScreenOverlay:
 
         self._clock_lbl = ctk.CTkLabel(
             header,
-            text="",
+            text=datetime.now().strftime("%d/%m/%Y  •  %H:%M:%S"),
             font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
             text_color="#E2E8F0",
         )
@@ -145,7 +193,6 @@ class LockScreenOverlay:
         )
         host_lbl.pack(side="right", padx=16)
 
-        # Rodapé
         footer = ctk.CTkFrame(self.win, fg_color="#0F172A", corner_radius=0, height=54)
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
@@ -174,7 +221,6 @@ class LockScreenOverlay:
         )
         self._contingency_btn.pack(side="right", padx=24, pady=10)
 
-        # Container Central
         center = ctk.CTkFrame(
             self.win,
             fg_color="#0F172A",
@@ -208,7 +254,6 @@ class LockScreenOverlay:
         )
         self._sub_lbl.pack(padx=32, pady=(0, 8))
 
-        # Moldura da Câmera
         self._cam_border = ctk.CTkFrame(
             center,
             fg_color="#020617",
@@ -223,16 +268,17 @@ class LockScreenOverlay:
 
         self._video_lbl = ctk.CTkLabel(
             self._cam_border,
-            text="Inicializando câmera segura...",
+            image=self._blank_ctk_img,
+            compound="center",
+            text="🔒 Estação Protegida\nIniciando leitor biométrico...",
             text_color="#94A3B8",
             font=ctk.CTkFont(family="Segoe UI", size=14),
         )
         self._video_lbl.place(relx=0.5, rely=0.5, anchor="center")
 
-        # Barra de Status Biométrico / Prova de Vida
         self._status_lbl = ctk.CTkLabel(
             center,
-            text="Aguardando leitura facial...",
+            text="Preparando leitura facial...",
             font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
             text_color="#38BDF8",
         )
@@ -244,7 +290,6 @@ class LockScreenOverlay:
         self._progress.set(0.15)
         self._progress.pack(padx=28, pady=(0, pad_y))
 
-        # Painel Oculto de Senha de Contingência da TI (inline para nunca perder foco no Kiosk)
         self._contingency_frame = ctk.CTkFrame(
             center, fg_color="#1E293B", corner_radius=10
         )
@@ -330,6 +375,8 @@ class LockScreenOverlay:
             )
 
     def _open_camera_if_needed(self) -> None:
+        if self._engine_loading:
+            return
         if self._cap is not None and self._cap.isOpened():
             return
         now = time.monotonic()
@@ -341,6 +388,8 @@ class LockScreenOverlay:
                 self._cap.release()
             except Exception:
                 pass
+        from src.vision_engine import open_fast_camera
+
         self._cap = open_fast_camera(self._camera_index, 640, 480)
 
     def _tick_clock(self) -> None:
@@ -351,7 +400,6 @@ class LockScreenOverlay:
         self.win.after(1000, self._tick_clock)
 
     def _tick_watchdog(self) -> None:
-        """Mantém a janela Kiosk sempre em primeiro plano sobre todos os monitores."""
         if not self.is_active:
             return
         try:
@@ -368,6 +416,10 @@ class LockScreenOverlay:
 
     def _tick_camera(self) -> None:
         if not self.is_active or self._unlocking:
+            return
+
+        if self._engine_loading or self.vision is None:
+            self.win.after(80, self._tick_camera)
             return
 
         self._open_camera_if_needed()
@@ -401,7 +453,6 @@ class LockScreenOverlay:
 
         now = time.monotonic()
 
-        # 1. Verifica sucesso de autenticação!
         if res.authenticated and res.matched_user is not None:
             self._cam_border.configure(border_color="#22C55E")
             self._status_lbl.configure(text=res.status_message, text_color="#4ADE80")
@@ -416,11 +467,10 @@ class LockScreenOverlay:
             )
             self._unlocking = True
             self.win.after(
-                320, lambda u=res.matched_user.name: self._complete_unlock(u, trigger_admin=False)
+                280, lambda u=res.matched_user.name: self._complete_unlock(u, trigger_admin=False)
             )
             return
 
-        # 2. Auditoria automática se rosto NÃO autorizado permanecer >= 1.4s olhando para a tela
         if (
             res.liveness_stage == "NAO_AUTORIZADO"
             and self.vision.tracker.unauthorized_since is not None
@@ -443,7 +493,6 @@ class LockScreenOverlay:
                     details="Pessoa não cadastrada tentou utilizar o computador",
                 )
 
-        # 3. Auditoria de possível fraude por foto/celular (rosto reconhecido sem piscar por >= 9s)
         if (
             res.matched_user is not None
             and self._require_liveness
@@ -464,7 +513,6 @@ class LockScreenOverlay:
             )
             self.vision.reset_tracker()
 
-        # 4. Atualiza cores e barra de progresso conforme estágio
         if now < self._alert_until:
             self._cam_border.configure(border_color="#EF4444")
             self._status_lbl.configure(text=self._alert_text, text_color="#F87171")
@@ -474,7 +522,7 @@ class LockScreenOverlay:
             self._cam_border.configure(border_color="#F59E0B")
             self._status_lbl.configure(text=res.status_message, text_color="#FCD34D")
             self._progress.configure(progress_color="#F59E0B")
-            if res.liveness_stage == "PISCANDO" or res.liveness_stage == "REABRINDO_OLHOS":
+            if res.liveness_stage in ("PISCANDO", "REABRINDO_OLHOS"):
                 self._progress.set(0.80)
             else:
                 self._progress.set(0.55)
@@ -492,7 +540,10 @@ class LockScreenOverlay:
         self._render_frame(frame_bgr, res)
         self.win.after(33, self._tick_camera)
 
-    def _render_frame(self, frame_bgr: np.ndarray, res) -> None:
+    def _render_frame(self, frame_bgr: Any, res: Any) -> None:
+        import cv2
+        from src.vision_engine import draw_hud_overlay
+
         hud_bgr = draw_hud_overlay(frame_bgr, res, mirror=True)
         rgb = cv2.cvtColor(hud_bgr, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
@@ -500,7 +551,7 @@ class LockScreenOverlay:
             light_image=pil_img, dark_image=pil_img, size=(self._cam_w, self._cam_h)
         )
         self._video_lbl.configure(image=ctk_img, text="")
-        self._video_lbl._current_image = ctk_img  # Evita coleta de lixo da imagem Tk
+        self._video_lbl._current_image = ctk_img
 
     def _complete_unlock(self, user_label: str, trigger_admin: bool = False) -> None:
         self.close()

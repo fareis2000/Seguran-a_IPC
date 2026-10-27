@@ -14,12 +14,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
-
-import cv2
-import numpy as np
+from typing import TYPE_CHECKING, Any, Iterator
 
 from src.paths import get_data_dir, get_db_path, get_intruders_dir
+
+if TYPE_CHECKING:
+    import numpy as np
 
 PBKDF2_ITERATIONS = 200_000
 
@@ -246,6 +246,9 @@ class StorageManager:
         embeddings: list[np.ndarray],
         thumbnail_bgr: np.ndarray | None = None,
     ) -> int:
+        import cv2
+        import numpy as np
+
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("Informe o nome do colaborador.")
@@ -287,6 +290,8 @@ class StorageManager:
             return user_id
 
     def list_users(self, only_active: bool = False) -> list[EnrolledUser]:
+        import numpy as np
+
         with self._lock, self._connect() as conn:
             query = "SELECT * FROM users"
             if only_active:
@@ -317,8 +322,16 @@ class StorageManager:
             return result
 
     def has_enrolled_users(self) -> bool:
-        users = self.list_users(only_active=True)
-        return any(len(u.embeddings) > 0 for u in users)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM face_embeddings fe
+                JOIN users u ON u.id = fe.user_id
+                WHERE u.active = 1
+                LIMIT 1
+                """
+            ).fetchone()
+            return row is not None
 
     def delete_user(self, user_id: int) -> None:
         with self._lock, self._connect() as conn:
@@ -353,7 +366,7 @@ class StorageManager:
             windows_user = os.environ.get("USERNAME", "desconhecido")
 
         photo_path_str: str | None = None
-        if frame_bgr is not None and frame_bgr.size > 0:
+        if frame_bgr is not None and getattr(frame_bgr, "size", 0) > 0:
             photo_path_str = self._save_evidence_photo(
                 frame_bgr=frame_bgr,
                 now=now,
@@ -396,6 +409,9 @@ class StorageManager:
     ) -> str | None:
         """Salva a foto do intruso com barra de metadados forenses de data/hora/PC."""
         try:
+            import cv2
+            import numpy as np
+
             evidence = frame_bgr.copy()
             h, w = evidence.shape[:2]
             banner_h = 44

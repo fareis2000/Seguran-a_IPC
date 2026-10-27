@@ -1,28 +1,35 @@
-"""Integração nativa Win32 (64-bit safe): bloqueio de atalhos de sistema, barra de tarefas,
-múltiplos monitores, eventos de desbloqueio/suspensão do Windows e inicialização automática."""
+"""Integração nativa Win32 (64-bit safe): prioridade de boot, Agendador de Tarefas ONLOGON
+com atraso zero, bloqueio de atalhos de sistema, barra de tarefas, múltiplos monitores
+e eventos de desbloqueio/suspensão do Windows."""
 
 from __future__ import annotations
 
 import atexit
 import ctypes
 from ctypes import wintypes
-import threading
 from dataclasses import dataclass
+from pathlib import Path
+import subprocess
+import threading
 from typing import Callable
 import winreg
 
-from src.paths import APP_NAME, MUTEX_NAME, get_executable_command
+from src.paths import (
+    APP_NAME,
+    MUTEX_NAME,
+    SCHEDULED_TASK_NAME,
+    get_executable_and_args,
+    get_executable_command,
+)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
 
-# Tipos inteiros 64-bit / 32-bit seguros para ponteiros e callbacks Win32
 LRESULT = ctypes.c_ssize_t
 WPARAM = ctypes.c_size_t
 LPARAM = ctypes.c_ssize_t
 
-# Constantes Win32
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
@@ -54,9 +61,13 @@ VK_MENU = 0x12
 SW_HIDE = 0
 SW_SHOW = 5
 
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+CREATE_NO_WINDOW = 0x08000000
+
 ERROR_ALREADY_EXISTS = 183
 MONITORINFOF_PRIMARY = 0x00000001
 RUN_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+EXPLORER_SERIALIZE_PATH = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize"
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -100,7 +111,7 @@ class WNDCLASSEXW(ctypes.Structure):
         ("style", wintypes.UINT),
         ("lpfnWndProc", WNDPROC_TYPE),
         ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
+        ("cbWndExtra", wintypes.INT),
         ("hInstance", wintypes.HINSTANCE),
         ("hIcon", wintypes.HICON),
         ("hCursor", wintypes.HANDLE),
@@ -111,7 +122,6 @@ class WNDCLASSEXW(ctypes.Structure):
     ]
 
 
-# Assinaturas explícitas 64-bit para evitar truncamento de ponteiros
 user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
 user32.DefWindowProcW.restype = LRESULT
 
@@ -199,6 +209,12 @@ kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.SetPriorityClass.restype = wintypes.BOOL
+
 kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
 
@@ -216,6 +232,16 @@ class MonitorGeometry:
     width: int
     height: int
     is_primary: bool
+
+
+def boost_process_priority() -> None:
+    """Eleva a prioridade do processo durante o boot para não competir com apps comuns."""
+    try:
+        kernel32.SetPriorityClass(
+            kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS
+        )
+    except Exception:
+        pass
 
 
 class SingleInstanceGuard:
@@ -291,7 +317,6 @@ atexit.register(_restore_taskbar_failsafe)
 
 
 def lock_windows_workstation() -> None:
-    """Aciona o bloqueio nativo da estação Windows (Win+L)."""
     try:
         user32.LockWorkStation()
     except Exception:
@@ -299,37 +324,127 @@ def lock_windows_workstation() -> None:
 
 
 # ------------------------------------------------------------------
-# Inicialização Automática no Logon do Windows (Registry Run)
+# Inicialização Instantânea no Logon (Task Scheduler ONLOGON Delay=0 + Registry Run)
 # ------------------------------------------------------------------
-def is_windows_startup_enabled() -> bool:
+def get_registered_run_command() -> str:
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, RUN_REGISTRY_PATH, 0, winreg.KEY_READ
         ) as key:
             val, _ = winreg.QueryValueEx(key, APP_NAME)
-            return bool(val)
-    except FileNotFoundError:
-        return False
+            return str(val) if val else ""
     except OSError:
+        return ""
+
+
+def is_windows_startup_enabled() -> bool:
+    return bool(get_registered_run_command())
+
+
+def _configure_zero_explorer_delay() -> None:
+    """Desativa o atraso artificial de 10s que o Windows Explorer aplica a itens de inicialização."""
+    try:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, EXPLORER_SERIALIZE_PATH, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.SetValueEx(key, "StartupDelayInMSec", 0, winreg.REG_DWORD, 0)
+            winreg.SetValueEx(key, "WaitForIdleState", 0, winreg.REG_DWORD, 0)
+    except OSError:
+        pass
+
+
+def _register_or_remove_logon_task(enabled: bool, exe_path: str, exe_args: str) -> bool:
+    """Registra (ou remove) tarefa ONLOGON de prioridade alta e atraso ZERO via COM Schedule.Service.
+    Dispara antes mesmo do Windows Explorer processar a pasta Inicializar!
+    """
+    safe_exe = exe_path.replace("'", "''")
+    safe_args = exe_args.replace("'", "''")
+    safe_dir = str(Path(exe_path).parent).replace("'", "''")
+
+    if enabled:
+        ps_script = (
+            "$ErrorActionPreference = 'Stop'; "
+            "$svc = New-Object -ComObject Schedule.Service; $svc.Connect(); "
+            "$folder = $svc.GetFolder('\\'); "
+            "$td = $svc.NewTask(0); "
+            "$td.RegistrationInfo.Description = 'SentinelPC - Bloqueio Facial Instantaneo no Logon'; "
+            "$t = $td.Triggers.Create(9); "
+            "$t.UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+            "$t.Delay = 'PT0S'; $t.Enabled = $true; "
+            "$s = $td.Settings; "
+            "$s.Enabled = $true; $s.Priority = 4; "
+            "$s.DisallowStartIfOnBatteries = $false; "
+            "$s.StopIfGoingOnBatteries = $false; "
+            "$s.ExecutionTimeLimit = 'PT0S'; "
+            "$s.MultipleInstances = 2; "
+            "$a = $td.Actions.Create(0); "
+            f"$a.Path = '{safe_exe}'; $a.Arguments = '{safe_args}'; $a.WorkingDirectory = '{safe_dir}'; "
+            f"$folder.RegisterTaskDefinition('{SCHEDULED_TASK_NAME}', $td, 6, $null, $null, 3) | Out-Null"
+        )
+    else:
+        ps_script = (
+            "$ErrorActionPreference = 'SilentlyContinue'; "
+            "$svc = New-Object -ComObject Schedule.Service; $svc.Connect(); "
+            f"$svc.GetFolder('\\').DeleteTask('{SCHEDULED_TASK_NAME}', 0)"
+        )
+
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            creationflags=CREATE_NO_WINDOW,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
         return False
 
 
 def set_windows_startup_enabled(enabled: bool) -> bool:
+    """Ativa/desativa simultaneamente:
+    1) Tarefa Agendada ONLOGON de atraso 0s e prioridade alta (inicia antes do Explorer);
+    2) Remoção do StartupDelayInMSec do Windows Explorer;
+    3) Chave Run no Registro como redundância.
+    """
+    exe_path, exe_args = get_executable_and_args(startup_mode=True)
+    full_cmd = get_executable_command(startup_mode=True)
+
+    reg_ok = False
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, RUN_REGISTRY_PATH, 0, winreg.KEY_SET_VALUE
         ) as key:
             if enabled:
-                cmd = get_executable_command(startup_mode=True)
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, full_cmd)
+                _configure_zero_explorer_delay()
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
                 except FileNotFoundError:
                     pass
-        return True
+        reg_ok = True
     except OSError:
-        return False
+        pass
+
+    task_ok = _register_or_remove_logon_task(enabled, exe_path, exe_args)
+    return reg_ok or task_ok
+
+
+def ensure_fast_startup_synced(storage) -> None:
+    """Garante que a tarefa ONLOGON rápida aponte para o executável atual sem atrasar o boot."""
+    expected_cmd = get_executable_command(startup_mode=True)
+    cached_task_cmd = storage.get_setting("fast_logon_task_cmd", "")
+    current_reg_cmd = get_registered_run_command()
+
+    if cached_task_cmd == expected_cmd and current_reg_cmd == expected_cmd:
+        return
+
+    def _bg_sync() -> None:
+        if set_windows_startup_enabled(True):
+            storage.set_setting("fast_logon_task_cmd", expected_cmd)
+
+    threading.Thread(target=_bg_sync, name="SentinelStartupSync", daemon=True).start()
 
 
 # ------------------------------------------------------------------
@@ -349,7 +464,6 @@ class WinSecurityController:
         self._hook_handle: wintypes.HHOOK | None = None
         self._hwnd: wintypes.HWND | None = None
         self._ready = threading.Event()
-        # Referências fortes a callbacks C para impedir coleta pelo GC
         self._kb_proc_ref: HOOKPROC_TYPE | None = None
         self._wnd_proc_ref: WNDPROC_TYPE | None = None
 
@@ -361,7 +475,7 @@ class WinSecurityController:
             target=self._win32_loop, name="SentinelWin32Hook", daemon=True
         )
         self._thread.start()
-        self._ready.wait(timeout=3.0)
+        self._ready.wait(timeout=2.0)
 
     def stop(self) -> None:
         self.set_kiosk_lock(False)
@@ -391,13 +505,10 @@ class WinSecurityController:
                 )
                 ctrl_down = user32.GetAsyncKeyState(VK_CONTROL) < 0
 
-                # Bloqueia teclas Windows, Menu de Contexto e PrintScreen
                 if vk in (VK_LWIN, VK_RWIN, VK_APPS, VK_SNAPSHOT):
                     return 1
-                # Bloqueia Alt+Tab, Alt+F4, Alt+Esc, Alt+Space
                 if alt_down and vk in (VK_TAB, VK_F4, VK_ESCAPE, VK_SPACE):
                     return 1
-                # Bloqueia Ctrl+Esc e Ctrl+Shift+Esc
                 if ctrl_down and vk == VK_ESCAPE:
                     return 1
 

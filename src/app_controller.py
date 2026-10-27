@@ -1,63 +1,66 @@
-"""Coordenador central do SentinelPC: Bandeja do Sistema (System Tray), fila thread-safe
-de eventos Win32 (Logon, Win+L Unlock, Suspensão) e ciclo de vida das janelas."""
+"""Coordenador central do SentinelPC com Instant-Lock no Boot:
+trava teclado e monitores imediatamente antes de carregar OpenCV/ONNX/Bandeja."""
 
 from __future__ import annotations
 
 import ctypes
 import queue
 import threading
-import customtkinter as ctk
-import pystray
+from typing import Any
 
-from src.icon_gen import create_shield_icon, ensure_icon_files
+import customtkinter as ctk
+
 from src.paths import APP_ICON_PATH, APP_NAME, APP_TITLE
 from src.storage import StorageManager
-from src.ui_admin_panel import AdminPanelWindow, AdminPasswordDialog, FirstSetupWizard
 from src.ui_lock_screen import LockScreenOverlay
-from src.vision_engine import BiometricVisionEngine
 from src.win_security import (
     SingleInstanceGuard,
     WinSecurityController,
+    boost_process_priority,
+    ensure_fast_startup_synced,
     set_taskbar_visible,
-    set_windows_startup_enabled,
 )
 
 
 class SentinelAppController:
-    """Orquestra a proteção contínua na sessão do Windows."""
+    """Orquestra a proteção contínua na sessão do Windows com inicialização instantânea."""
 
     def __init__(self, startup_mode: bool = False, open_admin_on_start: bool = False) -> None:
+        boost_process_priority()
         self.startup_mode = startup_mode
         self.open_admin_on_start = open_admin_on_start
         self._guard = SingleInstanceGuard()
         self._event_queue: queue.Queue[str] = queue.Queue()
 
+        self.vision: Any = None
         self._lock_overlay: LockScreenOverlay | None = None
-        self._admin_window: AdminPanelWindow | None = None
-        self._auth_dialog: AdminPasswordDialog | None = None
-        self._tray_icon: pystray.Icon | None = None
+        self._admin_window: Any = None
+        self._auth_dialog: Any = None
+        self._tray_icon: Any = None
         self._shutting_down = False
 
-        if not APP_ICON_PATH.exists():
-            try:
-                ensure_icon_files(APP_ICON_PATH)
-            except Exception:
-                pass
+        self.storage = StorageManager()
+        self.win_security = WinSecurityController(on_system_event=self._enqueue_event)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.storage = StorageManager()
-        self.vision = BiometricVisionEngine()
-        self.win_security = WinSecurityController(on_system_event=self._enqueue_event)
-
-        # Raiz única oculta do CustomTkinter (mantém o loop gráfico vivo em 0% CPU quando em bandeja)
         self.root = ctk.CTk()
         self.root.withdraw()
         self.root.title(APP_TITLE)
 
     def _enqueue_event(self, event_name: str) -> None:
         self._event_queue.put(event_name)
+
+    def _ensure_vision_engine(self) -> Any:
+        if self.vision is None:
+            from src.vision_engine import BiometricVisionEngine
+
+            self.vision = BiometricVisionEngine()
+        return self.vision
+
+    def _on_vision_loaded_async(self, engine: Any) -> None:
+        self.vision = engine
 
     def run(self) -> int:
         if self._guard.already_running:
@@ -73,15 +76,24 @@ class SentinelAppController:
             return 0
 
         self.win_security.start()
-        self._start_tray_icon()
 
-        # Sincroniza registro de inicialização do Windows se configurado
-        if self.storage.is_admin_configured() and self.storage.get_bool_setting(
-            "lock_on_startup", True
-        ):
-            set_windows_startup_enabled(True)
+        admin_ok = self.storage.is_admin_configured()
+        has_users = self.storage.has_enrolled_users()
+        lock_on_boot = self.storage.get_bool_setting("lock_on_startup", True)
 
-        self.root.after(120, self._initial_dispatch)
+        # Caminho ultrarrápido: bloqueia monitores + teclado IMEDIATAMENTE antes da bandeja/OpenCV!
+        if admin_ok and has_users and not self.open_admin_on_start and lock_on_boot:
+            reason = (
+                "Inicialização do Windows"
+                if self.startup_mode
+                else "Início de Sessão Protegida"
+            )
+            self.activate_lock_screen(reason=reason)
+        else:
+            self.root.after(40, self._deferred_non_lock_dispatch)
+
+        # Inicializa ícone de bandeja e sincronização da Tarefa Agendada sem atrasar o bloqueio
+        self.root.after(200, self._post_lock_background_init)
         self.root.after(150, self._poll_queue)
 
         try:
@@ -90,8 +102,28 @@ class SentinelAppController:
             self._cleanup()
         return 0
 
-    def _initial_dispatch(self) -> None:
+    def _post_lock_background_init(self) -> None:
+        if self._shutting_down:
+            return
+        if not APP_ICON_PATH.exists():
+            try:
+                from src.icon_gen import ensure_icon_files
+
+                ensure_icon_files(APP_ICON_PATH)
+            except Exception:
+                pass
+
+        self._start_tray_icon()
+
+        if self.storage.is_admin_configured() and self.storage.get_bool_setting(
+            "lock_on_startup", True
+        ):
+            ensure_fast_startup_synced(self.storage)
+
+    def _deferred_non_lock_dispatch(self) -> None:
         if not self.storage.is_admin_configured():
+            from src.ui_admin_panel import FirstSetupWizard
+
             FirstSetupWizard(
                 master=self.root,
                 storage=self.storage,
@@ -106,16 +138,6 @@ class SentinelAppController:
 
         if self.open_admin_on_start:
             self._prompt_admin_panel()
-            return
-
-        # Se há rostos cadastrados e bloqueio inicial está ativo, exige autenticação facial imediata!
-        if self.storage.get_bool_setting("lock_on_startup", True):
-            reason = (
-                "Inicialização do Windows"
-                if self.startup_mode
-                else "Início de Sessão Protegida"
-            )
-            self.activate_lock_screen(reason=reason)
 
     def _poll_queue(self) -> None:
         if self._shutting_down:
@@ -157,7 +179,6 @@ class SentinelAppController:
         if self._lock_overlay is not None and self._lock_overlay.is_active:
             return
 
-        # Fecha janelas administrativas abertas para liberar a câmera imediatamente
         if self._admin_window is not None and self._admin_window.is_open:
             self._admin_window.close()
             self._admin_window = None
@@ -172,6 +193,7 @@ class SentinelAppController:
             win_security=self.win_security,
             on_unlocked=self._on_lock_released,
             on_open_admin=self._open_admin_panel_direct,
+            on_vision_ready=self._on_vision_loaded_async,
             reason=reason,
         )
 
@@ -179,6 +201,8 @@ class SentinelAppController:
         self._lock_overlay = None
 
     def _prompt_admin_panel(self) -> None:
+        from src.ui_admin_panel import AdminPasswordDialog, FirstSetupWizard
+
         if not self.storage.is_admin_configured():
             FirstSetupWizard(
                 master=self.root,
@@ -206,16 +230,19 @@ class SentinelAppController:
         )
 
     def _open_admin_panel_direct(self) -> None:
+        from src.ui_admin_panel import AdminPanelWindow
+
         self._lock_overlay = None
         if self._admin_window is not None and self._admin_window.is_open:
             self._admin_window.win.lift()
             self._admin_window.win.focus_force()
             return
 
+        vision = self._ensure_vision_engine()
         self._admin_window = AdminPanelWindow(
             master=self.root,
             storage=self.storage,
-            vision=self.vision,
+            vision=vision,
             on_test_lock=lambda: self.activate_lock_screen("Teste de Bloqueio (TI)"),
             on_closed=self._on_admin_closed,
         )
@@ -224,6 +251,8 @@ class SentinelAppController:
         self._admin_window = None
 
     def _prompt_quit(self) -> None:
+        from src.ui_admin_panel import AdminPasswordDialog
+
         if not self.storage.is_admin_configured():
             self.shutdown()
             return
@@ -242,6 +271,11 @@ class SentinelAppController:
         )
 
     def _start_tray_icon(self) -> None:
+        if self._tray_icon is not None:
+            return
+        import pystray
+        from src.icon_gen import create_shield_icon
+
         tray_img = create_shield_icon(64)
         menu = pystray.Menu(
             pystray.MenuItem(
