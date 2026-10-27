@@ -33,13 +33,16 @@ flowchart TD
 - **Interceptação de Teclas (`WH_KEYBOARD_LL`)**: bloqueia em baixo nível atalhos de fuga como `Win`, `Alt+Tab`, `Alt+F4`, `Alt+Esc`, `Alt+Space`, `Ctrl+Esc`, `Ctrl+Shift+Esc` e `PrintScreen`.
 - **Ocultação Segura da Barra de Tarefas**: oculta `Shell_TrayWnd` e `Shell_SecondaryTrayWnd` durante o bloqueio e garante restauração automática via *failsafe* (`atexit` / `finally`).
 
-### 3. Pipeline Biométrico 100% Offline + Prova de Vida Anti-Foto
+### 3. Pipeline Biométrico 100% Offline + Consenso Multi-Camada + Prova de Vida
 Todo o processamento ocorre localmente na CPU da estação, sem enviar imagens para nuvem:
-1. **Detecção Facial (`YuNet`)**: localiza o rosto e 5 pontos de referência com baixa latência.
-2. **Reconhecimento Facial (`SFace 128D`)**: alinha o rosto e extrai um vetor matemático de 128 dimensões, comparando por similaridade de cosseno contra as **5 amostras biométricas** cadastradas do dono do PC.
+1. **Detecção Facial & Filtro de Pose Frontal (`YuNet`)**: localiza o rosto e os 5 pontos de referência com baixa latência, rejeitando perfis laterais extremos ou cabeças inclinadas que possam distorcer o alinhamento.
+2. **Reconhecimento Facial por Consenso Estrito (`SFace 128D`, Limiar Corporativo `0.58`)**:
+   - Alinha o rosto e extrai um vetor matemático de 128 dimensões.
+   - Em vez de confiar em uma única amostra isolada, calcula o **consenso simultâneo** entre o **centroide médio L2** do colaborador, a **média das Top-3 amostras** e a concordância mínima individual entre as 5 amostras cadastradas.
+   - Aplica **validação temporal multi-frame**, exigindo múltiplos frames consecutivos aprovados antes e depois da piscada (eliminando falsos-positivos por ruído de câmera).
 3. **Prova de Vida por Piscada (`InsightFace 2d106det`)**:
    - Extrai 106 pontos faciais em tempo real para medir a abertura das pálpebras (*Eye Aspect Ratio — EAR*) com calibração adaptativa para o formato de olho do usuário.
-   - Exige uma sequência contínua **Olhos Abertos → Piscada → Olhos Reabertos** no **mesmo rosto rastreado espacialmente**, impedindo fraudes com fotos estáticas exibidas na tela do celular.
+   - Exige uma sequência contínua **Olhos Abertos (≥ 4 frames) → Piscada → Olhos Reabertos (≥ 2 frames)** no **mesmo rosto rastreado espacialmente**, impedindo fraudes com fotos estáticas exibidas na tela do celular.
 
 ### 4. Auditoria Fotográfica de Intrusos
 O sistema fotografa automaticamente pela webcam e grava uma **tarja forense na imagem** (contendo data, hora, nome da máquina, usuário do Windows e *score* biométrico) em três situações:
