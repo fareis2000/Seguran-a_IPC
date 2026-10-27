@@ -1,0 +1,47 @@
+# Ambientes virtuais Python
+.venv/
+venv/
+env/
+
+# Cache e bytecodes Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Artefatos de compilação e executáveis (PyInstaller)
+build/
+dist/
+*.spec
+*.exe
+
+# Segurança, bancos de dados biométricos e credenciais locais
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.cer
+secrets.*
+credentials.*
+config.local.*
+
+# Diretórios de evidências, perfis faciais e auditoria (caso criados localmente)
+intrusos/
+perfis/
+evidencias/
+logs/
+*.log
+
+# Arquivos de sistema e IDEs
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
